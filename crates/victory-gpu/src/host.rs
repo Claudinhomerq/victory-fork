@@ -1986,11 +1986,11 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
-/// Groups `spans` `(copy, lo, hi)` (sorted by `(copy, lo)`) into minimal
-/// overlapping components (`groups`) and packs those components into up to
-/// `max_chunks` contiguous byte-disjoint `chunks` for parallel merge.
+/// Groups overlapping title-address spans (sorted by start address) and
+/// packs the groups into up to `max_chunks` disjoint chunks for parallel merge.
+/// Distinct host copies can cover the same title memory.
 fn partition_disjoint_merge_chunks(
-    spans: &[(usize, usize, usize)],
+    spans: &[(u64, u64)],
     max_chunks: usize,
 ) -> (Vec<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>) {
     if spans.is_empty() {
@@ -1998,15 +1998,13 @@ fn partition_disjoint_merge_chunks(
     }
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
     let mut start = 0usize;
-    let mut cur_copy = spans[0].0;
-    let mut max_hi = spans[0].2;
-    for (i, &(copy, lo, hi)) in spans.iter().enumerate().skip(1) {
-        if copy == cur_copy && lo < max_hi {
+    let mut max_hi = spans[0].1;
+    for (i, &(lo, hi)) in spans.iter().enumerate().skip(1) {
+        if lo < max_hi {
             max_hi = max_hi.max(hi);
         } else {
             groups.push(start..i);
             start = i;
-            cur_copy = copy;
             max_hi = hi;
         }
     }
@@ -2074,32 +2072,21 @@ mod relay_tests {
         assert_eq!(fetch.len(), 2);
     }
 
-    /// Parallel merge chunks never split overlapping ranges of the same copy.
+    /// The first three ranges could come from distinct copies that alias.
+    /// Overlap is transitive, but touching ranges can run independently.
     #[test]
     fn disjoint_merge_chunks_keep_overlaps_together() {
         let spans = [
-            (1, 0, 100),
-            (1, 50, 200),
-            (1, 150, 300),
-            (1, 300, 400),
-            (2, 0, 64),
-            (2, 64, 128),
+            (0x1000, 0x1080),
+            (0x1040, 0x1100),
+            (0x10c0, 0x1180),
+            (0x1180, 0x1200),
+            (0x2000, 0x2040),
+            (0x2040, 0x2080),
         ];
         let (groups, chunks) = partition_disjoint_merge_chunks(&spans, 3);
         assert_eq!(groups, vec![0..3, 3..4, 4..5, 5..6]);
-        assert_eq!(chunks.iter().map(|r| r.len()).sum::<usize>(), spans.len());
-        // No two chunks may overlap on the same copy.
-        for i in 0..chunks.len() {
-            for j in (i + 1)..chunks.len() {
-                for &(c1, l1, h1) in &spans[chunks[i].clone()] {
-                    for &(c2, l2, h2) in &spans[chunks[j].clone()] {
-                        if c1 == c2 {
-                            assert!(h1 <= l2 || h2 <= l1, "chunks {i} and {j} overlap");
-                        }
-                    }
-                }
-            }
-        }
+        assert_eq!(chunks, vec![0..3, 3..5, 5..6]);
     }
 }
 
@@ -3864,10 +3851,15 @@ impl Host {
             CARD_STATS[4].fetch_add(total_bytes, Ordering::Relaxed);
         }
         let written: usize = if wide_merge() && merge_work.len() >= 8 {
-            merge_work.sort_unstable_by_key(|(s, lo, _, _, after)| (std::sync::Arc::as_ptr(s) as usize, *lo, *after));
-            let spans: Vec<(usize, usize, usize)> = merge_work
+            // Workers do a read-modify-write in title memory. Aliased host
+            // copies must land in the same worker even if their Arc differs.
+            merge_work.sort_unstable_by_key(|(s, lo, _, _, after)| (s.span().0 + *lo as u64, *after));
+            let spans: Vec<_> = merge_work
                 .iter()
-                .map(|(s, lo, hi, _, _)| (std::sync::Arc::as_ptr(s) as usize, *lo, *hi))
+                .map(|(s, lo, hi, _, _)| {
+                    let start = s.span().0;
+                    (start + *lo as u64, start + *hi as u64)
+                })
                 .collect();
             let (groups, chunks) = partition_disjoint_merge_chunks(&spans, 8);
             for g in groups {
